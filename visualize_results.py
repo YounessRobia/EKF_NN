@@ -156,18 +156,98 @@ class ResultsVisualizer:
             for key, value in summary.items():
                 f.write(f'{key}: {value}\n')
 
+class ComparisonVisualizer:
+    """Visualization tools for comparing Hybrid EKF-DL with Standard EKF."""
+    
+    def __init__(self, hybrid_results_path: Path, standard_results_path: Path):
+        """Initialize visualizer with both results."""
+        self.hybrid_results = np.load(hybrid_results_path)
+        self.standard_results = np.load(standard_results_path)
+        self.time_steps = np.arange(len(self.hybrid_results['true_states']))
+        
+        sns.set_palette("husl")
+    
+    def plot_comparison_trajectories(self, save_path: Optional[Path] = None) -> None:
+        """Plot state trajectories comparing both filters."""
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        state_labels = ['x', 'y', 'z']
+        
+        for i, (ax, label) in enumerate(zip(axes, state_labels)):
+            # True trajectory
+            ax.plot(self.time_steps, self.hybrid_results['true_states'][:, i],
+                   'k-', label='True', linewidth=2)
+            
+            # Hybrid EKF estimate
+            ax.plot(self.time_steps, self.hybrid_results['estimated_states'][:, i],
+                   'b--', label='Hybrid EKF')
+            
+            # Standard EKF estimate
+            ax.plot(self.time_steps, self.standard_results['estimated_states'][:, i],
+                   'r--', label='Standard EKF')
+            
+            ax.set_ylabel(f'State {label}')
+            ax.legend()
+        
+        axes[-1].set_xlabel('Time Step')
+        plt.suptitle('State Trajectory Comparison')
+        
+        if save_path:
+            plt.savefig(save_path / 'comparison_trajectories.png', dpi=300, bbox_inches='tight')
+    
+    def plot_error_comparison(self, save_path: Optional[Path] = None) -> None:
+        """Plot error metrics comparison."""
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # RMSE comparison
+        hybrid_rmse = np.sqrt(np.mean(self.hybrid_results['estimation_errors']**2, axis=1))
+        standard_rmse = np.sqrt(np.mean(self.standard_results['estimation_errors']**2, axis=1))
+        
+        axes[0].plot(self.time_steps, hybrid_rmse, 'b-', label='Hybrid EKF')
+        axes[0].plot(self.time_steps, standard_rmse, 'r-', label='Standard EKF')
+        axes[0].set_ylabel('RMSE')
+        axes[0].legend()
+        axes[0].set_title('RMSE Comparison')
+        
+        # Error distribution comparison
+        axes[1].violinplot([hybrid_rmse, standard_rmse], positions=[1, 2])
+        axes[1].set_xticks([1, 2])
+        axes[1].set_xticklabels(['Hybrid EKF', 'Standard EKF'])
+        axes[1].set_ylabel('Error Distribution')
+        axes[1].set_title('Error Distribution Comparison')
+        
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path / 'error_comparison.png', dpi=300, bbox_inches='tight')
+    
+    def generate_comparison_report(self, save_path: Path) -> None:
+        """Generate comprehensive comparison report."""
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        self.plot_comparison_trajectories(save_path)
+        self.plot_error_comparison(save_path)
+        
+        # Compute summary statistics
+        hybrid_rmse = np.sqrt(np.mean(self.hybrid_results['estimation_errors']**2))
+        standard_rmse = np.sqrt(np.mean(self.standard_results['estimation_errors']**2))
+        
+        with open(save_path / 'comparison_summary.txt', 'w') as f:
+            f.write(f'Hybrid EKF RMSE: {hybrid_rmse:.4f}\n')
+            f.write(f'Standard EKF RMSE: {standard_rmse:.4f}\n')
+            f.write(f'Improvement: {((standard_rmse - hybrid_rmse) / standard_rmse * 100):.2f}%\n')
+
 def main():
     """Main function to generate visualization report."""
     logging.basicConfig(level=logging.INFO)
     
     try:
-        results_path = Path('simulation_results.npz')
-        output_path = Path('visualization_results')
+        hybrid_results_path = Path('hybrid_results.npz')
+        standard_results_path = Path('standard_results.npz')
+        output_path = Path('comparison_results')
         
-        visualizer = ResultsVisualizer(results_path)
-        visualizer.generate_report(output_path)
+        comparison_visualizer = ComparisonVisualizer(hybrid_results_path, standard_results_path)
+        comparison_visualizer.generate_comparison_report(output_path)
         
-        logging.info(f'Visualization report generated in {output_path}')
+        logging.info(f'Comparison report generated in {output_path}')
         
     except Exception as e:
         logging.error(f'Visualization failed: {str(e)}', exc_info=True)

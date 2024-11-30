@@ -424,7 +424,7 @@ def main():
         )
         system = LorenzSystem()
         time_steps = 1000
-        save_path = Path("simulation_results.npz")
+        save_path = Path("hybrid_results.npz")
         
         # Run simulation with progress tracking
         results = simulate_and_estimate(

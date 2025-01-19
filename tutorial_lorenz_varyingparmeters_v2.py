@@ -314,82 +314,65 @@ class PhysicsSequenceNetwork(nn.Module):
         return corrected_state, physics_loss
 
 
-class EnhancedUncertaintyNetwork(nn.Module):
+class SimplifiedUncertaintyNetwork(nn.Module):
     """
-    Advanced uncertainty network with attention and multi-head estimation.
-    It uses an LSTM (bidirectional) to output Q/R estimates from the last
-    `sequence_length` states/innovations.
+    A streamlined uncertainty network that estimates process (Q) and measurement (R) 
+    noise covariances for Kalman filtering. Key simplifications:
+    1. Removed multi-head attention layer
+    2. Single LSTM instead of bidirectional
+    3. Simplified architecture with fewer layers
+    4. Direct estimation instead of separate mean/std
     """
-    def __init__(self, 
-                 state_dim: int = 3,
-                 measurement_dim: int = 2,
-                 hidden_dim: int = 64,
-                 num_heads: int = 4,
-                 sequence_length: int = 5) -> None:
+    def __init__(self,
+                state_dim: int = 3,
+                measurement_dim: int = 2,
+                hidden_dim: int = 64,
+                sequence_length: int = 5) -> None:
         super().__init__()
-
+        
         self.state_dim = state_dim
         self.measurement_dim = measurement_dim
         self.sequence_length = sequence_length
 
-        # State encoder
+        # Single state encoder with normalization
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
+            nn.ReLU()
         )
 
-        # Multi-head self-attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=0.1,
+        # Single-layer LSTM
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
             batch_first=True
         )
 
-        # Bidirectional LSTM
-        self.lstm = nn.LSTM(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim // 2,
-            num_layers=2,
-            bidirectional=True,
-            batch_first=True,
-            dropout=0.1
-        )
-
-        # Process noise estimation
+        # Simplified process noise (Q) estimator
         self.q_estimator = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(hidden_dim, state_dim * state_dim)
         )
 
-        # Measurement noise estimation
+        # Simplified measurement noise (R) estimator
         self.r_estimator = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(hidden_dim, measurement_dim * measurement_dim)
         )
 
-        # Confidence network
-        self.confidence_estimator = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 2),
+        # Single confidence estimator
+        self.confidence_net = nn.Sequential(
+            nn.Linear(hidden_dim, 2),
             nn.Sigmoid()
         )
 
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
-        """
-        Orthogonal initialization for linear layers.
-        """
+        """Simple orthogonal initialization for linear layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight)
@@ -398,59 +381,55 @@ class EnhancedUncertaintyNetwork(nn.Module):
     def forward(self, 
                 state_sequence: torch.Tensor,
                 innovation_sequence: torch.Tensor,
-                dt: float = 0.01) -> Dict[str, torch.Tensor]:
+                dt: float = 0.01) -> dict:
         """
-        Forward pass to estimate Q/R mean and std, plus confidence.
+        Forward pass to estimate Q and R matrices.
+        
+        Args:
+            state_sequence: Shape (batch_size, sequence_length, state_dim)
+            innovation_sequence: Shape (batch_size, sequence_length, measurement_dim)
+            dt: Time step for scaling Q
+
+        Returns:
+            Dictionary containing Q and R estimates with confidences
         """
-        # Encode states
         batch_size = state_sequence.size(0)
-        encoded = self.state_encoder(state_sequence)  # (B, T, hidden_dim)
-
-        # Self-attention
-        attended, _ = self.attention(encoded, encoded, encoded)  # (B, T, hidden_dim)
-
-        # Bi-LSTM
-        lstm_out, _ = self.lstm(attended)       # (B, T, hidden_dim)
-        hidden = lstm_out[:, -1, :]             # last time-step (B, hidden_dim)
-
-        # Q
-        q_params = self.q_estimator(hidden)  # (B, state_dim^2)
-        Q_mean = q_params.view(batch_size, self.state_dim, self.state_dim)
-        Q_mean = 0.5 * (Q_mean + Q_mean.transpose(-2, -1))  # symmetrize
-        Q_mean = F.softplus(Q_mean) * dt
-
-        # R
-        r_params = self.r_estimator(hidden)  # (B, measurement_dim^2)
-        R_mean = r_params.view(batch_size, self.measurement_dim, self.measurement_dim)
-        R_mean = 0.5 * (R_mean + R_mean.transpose(-2, -1))
-        R_mean = F.softplus(R_mean)
-
-        # Confidence
-        confidence = self.confidence_estimator(hidden)  # (B, 2)
-        q_confidence = confidence[:, 0]
-        r_confidence = confidence[:, 1]
-
-        Q_std = (1.0 - q_confidence).unsqueeze(-1).unsqueeze(-1) * Q_mean
-        R_std = (1.0 - r_confidence).unsqueeze(-1).unsqueeze(-1) * R_mean
-
+        
+        # Encode states
+        encoded = self.state_encoder(state_sequence)
+        
+        # Process through LSTM
+        lstm_out, _ = self.lstm(encoded)
+        hidden = lstm_out[:, -1, :]  # Use final timestep
+        
+        # Estimate Q
+        q_raw = self.q_estimator(hidden)
+        Q = q_raw.view(batch_size, self.state_dim, self.state_dim)
+        Q = 0.5 * (Q + Q.transpose(-2, -1))  # Ensure symmetry
+        Q = F.softplus(Q) * dt  # Ensure positive definiteness and scale
+        
+        # Estimate R
+        r_raw = self.r_estimator(hidden)
+        R = r_raw.view(batch_size, self.measurement_dim, self.measurement_dim)
+        R = 0.5 * (R + R.transpose(-2, -1))  # Ensure symmetry
+        R = F.softplus(R)  # Ensure positive definiteness
+        
+        # Estimate confidences
+        confidence = self.confidence_net(hidden)
+        q_conf, r_conf = confidence[:, 0], confidence[:, 1]
+        
         return {
-            'Q_mean': Q_mean,
-            'Q_std': Q_std,
-            'R_mean': R_mean,
-            'R_std': R_std,
-            'q_confidence': q_confidence,
-            'r_confidence': r_confidence
+            'Q': Q,
+            'R': R,
+            'q_confidence': q_conf,
+            'r_confidence': r_conf
         }
 
     def get_regularization_loss(self) -> torch.Tensor:
-        """
-        Optional L2 regularization on all parameters.
-        """
-        all_params = []
+        """Simple L2 regularization on all parameters."""
+        l2_loss = 0.0
         for param in self.parameters():
-            if param.requires_grad:
-                all_params.append(param.view(-1))
-        l2_loss = torch.norm(torch.cat(all_params))
+            l2_loss += torch.sum(param ** 2)
         return 0.01 * l2_loss
 
 
@@ -461,7 +440,7 @@ class IntegratedHybridEKF:
     """
     Hybrid EKF that merges:
       - Physics-based prediction (LorenzSystem + sequential PhysicsNetwork)
-      - Uncertainty estimation from EnhancedUncertaintyNetwork
+      - Uncertainty estimation from SimplifiedUncertaintyNetwork
       - Extended Kalman Filter update
       - Online learning with backprop
     """
@@ -481,7 +460,7 @@ class IntegratedHybridEKF:
             sequence_length=config.sequence_length
         ).to(DEVICE)
 
-        self.uncertainty_net = EnhancedUncertaintyNetwork(
+        self.uncertainty_net = SimplifiedUncertaintyNetwork(
             state_dim=config.state_dim,
             measurement_dim=config.measurement_dim,
             hidden_dim=config.hidden_dim,
@@ -547,7 +526,7 @@ class IntegratedHybridEKF:
 
             # 3) Uncertainty estimation
             uncertainty = self._get_uncertainty_estimates()
-            Q_raw = uncertainty['Q_mean'] + uncertainty['Q_std']
+            Q_raw = uncertainty['Q'] + uncertainty['Q']
             Q_np = Q_raw.squeeze(0).cpu().numpy()
             Q_np = 0.5 * (Q_np + Q_np.T)
 
@@ -564,30 +543,24 @@ class IntegratedHybridEKF:
 
     def update(self, measurement: np.ndarray) -> None:
         """
-        EKF update step:
-          1) Validate states/covariance
-          2) Construct measurement model
-          3) Compute Kalman gain & correct state
-          4) Update covariance
-          5) Online learning
+        EKF update step with simplified uncertainty estimates
         """
         try:
-            # 1) Validate
+            # Validate states/covariance
             measurement = self.state_validator.validate_state(measurement).squeeze()
             self.x_hat = self.state_validator.validate_state(self.x_hat).squeeze()
             self.P = self.state_validator.validate_covariance(self.P).squeeze()
 
-            # 2) Partial measurement model (H)
+            # Partial measurement model (H)
             H = np.zeros((self.config.measurement_dim, self.config.state_dim))
             H[0, 0] = 1.0  # observe x
             H[1, 2] = 1.0  # observe z
 
             measured_components = measurement.astype(np.float64)
 
-            # 3) Uncertainty: R
+            # Uncertainty: R
             uncertainty = self._get_uncertainty_estimates()
-            R_raw = uncertainty['R_mean'] + uncertainty['R_std']
-            R_np = R_raw.squeeze(0).cpu().numpy()
+            R_np = uncertainty['R'].squeeze(0).cpu().numpy()
             R_np = 0.5 * (R_np + R_np.T)
             R_np = np.maximum(R_np, self.config.min_covariance * np.eye(self.config.measurement_dim))
 
@@ -611,7 +584,7 @@ class IntegratedHybridEKF:
             self.x_hat = self.state_validator.validate_state(self.x_hat)
             self.P = self.state_validator.validate_covariance(self.P)
 
-            # 5) Online learning
+            # Online learning
             if not np.any(np.isnan(self.x_hat)):
                 self._update_buffers(self.x_hat, innovation)
                 self._online_learning(measurement, innovation, uncertainty)
@@ -622,7 +595,7 @@ class IntegratedHybridEKF:
 
     def _get_uncertainty_estimates(self) -> Dict[str, torch.Tensor]:
         """
-        Returns Q/R from the EnhancedUncertaintyNetwork.
+        Returns Q/R from the SimplifiedUncertaintyNetwork.
         If insufficient data, return default values.
         """
         if len(self.state_buffer) < self.config.sequence_length:
@@ -630,10 +603,8 @@ class IntegratedHybridEKF:
             eye_Q = torch.eye(self.config.state_dim, device=DEVICE) * self.config.process_noise_init
             eye_R = torch.eye(self.config.measurement_dim, device=DEVICE) * self.config.measurement_noise_init
             return {
-                'Q_mean': eye_Q.unsqueeze(0),
-                'Q_std': torch.zeros_like(eye_Q).unsqueeze(0),
-                'R_mean': eye_R.unsqueeze(0),
-                'R_std': torch.zeros_like(eye_R).unsqueeze(0),
+                'Q': eye_Q.unsqueeze(0),
+                'R': eye_R.unsqueeze(0),
                 'q_confidence': torch.tensor([0.5], device=DEVICE),
                 'r_confidence': torch.tensor([0.5], device=DEVICE)
             }
@@ -661,7 +632,7 @@ class IntegratedHybridEKF:
         """
         Train the physics_net and uncertainty_net using the most recent data.
         """
-        # ----------------- Physics Net Training -----------------
+        # Physics Net Training
         self.physics_optimizer.zero_grad()
 
         if len(self.state_buffer) == self.config.sequence_length:
@@ -675,21 +646,17 @@ class IntegratedHybridEKF:
             measurement_tensor = torch.FloatTensor(measurement).unsqueeze(0).to(DEVICE)
 
             corrected, physics_loss = self.physics_net(states_tensor, physics_pred_tensor)
-            # corrected is shape (B, 3); measurement_tensor is shape (B, 2)
             partial_corrected = torch.stack([corrected[:, 0], corrected[:, 2]], dim=-1)
             partial_loss = F.mse_loss(partial_corrected, measurement_tensor)
 
             physics_total_loss = partial_loss + 0.1 * physics_loss
-
-
             physics_total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.physics_net.parameters(), 1.0)
             self.physics_optimizer.step()
 
             self.metrics['prediction_loss'].append(partial_loss.item())
 
-        # ----------------- Uncertainty Net Training -----------------
-        if len(self.state_buffer) == self.config.sequence_length:
+            # Uncertainty Net Training
             self.uncertainty_optimizer.zero_grad()
 
             state_seq = torch.FloatTensor(list(self.state_buffer)).unsqueeze(0).to(DEVICE)
@@ -697,8 +664,8 @@ class IntegratedHybridEKF:
 
             current_uncert = self.uncertainty_net(state_seq, innov_seq, dt=self.config.dt)
             nll_loss = self._compute_uncertainty_loss(innovation, 
-                                                      current_uncert['R_mean'], 
-                                                      current_uncert['R_std'])
+                                                    current_uncert['R'], 
+                                                    None)  # No separate R_std needed
             reg_loss = self.uncertainty_net.get_regularization_loss()
             uncertainty_loss = nll_loss + reg_loss
 
@@ -712,14 +679,14 @@ class IntegratedHybridEKF:
             self.metrics['r_confidence'].append(uncertainty['r_confidence'].item())
 
     def _compute_uncertainty_loss(self,
-                                  innovation: np.ndarray,
-                                  R_mean: torch.Tensor,
-                                  R_std: torch.Tensor) -> torch.Tensor:
+                                innovation: np.ndarray,
+                                R: torch.Tensor,
+                                _: None) -> torch.Tensor:  # Removed R_std parameter
         """
         Negative log-likelihood for measurement innovation ~ N(0, R).
         """
         innovation_tensor = torch.FloatTensor(innovation).to(DEVICE)
-        R_total = R_mean + R_std
+        R_total = R  # No need to add std
         R_total = torch.clamp(R_total, min=self.config.min_covariance)
         R_2x2 = R_total.squeeze(0)
         logdetR = torch.logdet(R_2x2)
@@ -899,6 +866,7 @@ def simulate_system(
 ) -> Dict[str, np.ndarray]:
     """
     Run a simulation of the Lorenz system with the IntegratedHybridEKF.
+    Now includes covariance storage.
     """
     system = LorenzSystem()
     ekf = IntegratedHybridEKF(system, config)
@@ -907,6 +875,7 @@ def simulate_system(
     true_states = np.zeros((time_steps, config.state_dim))
     estimated_states = np.zeros_like(true_states)
     uncertainties = np.zeros((time_steps, 2))  # store [q_conf, r_conf]
+    state_covariances = np.zeros((time_steps, config.state_dim, config.state_dim))
 
     # Initial state
     x_true = np.array([1.0, 1.0, 1.0])
@@ -919,8 +888,7 @@ def simulate_system(
         x_true = system.dynamics(x_true, config.dt)
         true_states[t] = x_true
 
-        # Noisy measurement
-        # New: measure only x,z
+        # Noisy measurement (x,z only)
         measured_xz = x_true[[0, 2]] + np.random.normal(
             0, config.measurement_noise_init, size=2
         )
@@ -930,8 +898,9 @@ def simulate_system(
         ekf.update(measured_xz)
 
         estimated_states[t] = ekf.x_hat
+        state_covariances[t] = ekf.P.copy()  # Store covariance
 
-        # Attempt to record Q/R confidence if available
+        # Record uncertainties if available
         if ekf.metrics['q_confidence'] and ekf.metrics['r_confidence']:
             uncertainties[t, 0] = ekf.metrics['q_confidence'][-1]
             uncertainties[t, 1] = ekf.metrics['r_confidence'][-1]
@@ -940,7 +909,8 @@ def simulate_system(
         'true_states': true_states,
         'estimated_states': estimated_states,
         'uncertainties': uncertainties,
-        'metrics': ekf.metrics
+        'metrics': ekf.metrics,
+        'state_covariances': state_covariances  # Add covariances to results
     }
 
     if save_path:
@@ -955,18 +925,13 @@ def simulate_comparative_system(
     config: Optional[HybridEKFConfig] = None
 ) -> Dict[str, np.ndarray]:
     """
-    Run a comparative simulation with:
-      - IntegratedHybridEKF
-      - StandardEKF
-      - UnscentedKF
-
-    Returns a dictionary with states from each filter plus the true states.
+    Run a comparative simulation with uncertainty tracking for Hybrid EKF.
     """
     if config is None:
         config = HybridEKFConfig(dt=dt)
 
     # Create a single system for generating true states
-    true_system = LorenzSystem(time_varying=True, variation_amplitude=0.9)
+    true_system = LorenzSystem(time_varying=True, variation_amplitude=2.1)
     filter_system = LorenzSystem(time_varying=False)  # Filters assume constant parameters    
     # Initialize the three filters with the same system
     hybrid_ekf = IntegratedHybridEKF(filter_system, config)
@@ -978,6 +943,9 @@ def simulate_comparative_system(
     hybrid_states = np.zeros_like(true_states)
     standard_states = np.zeros_like(true_states)
     ukf_states = np.zeros_like(true_states)
+
+    # Add storage for Hybrid EKF covariances
+    hybrid_covariances = np.zeros((time_steps, config.state_dim, config.state_dim))
 
     x_true = np.array([1.0, 1.0, 1.0])  # initial condition
 
@@ -1009,11 +977,15 @@ def simulate_comparative_system(
         ukf.update(measured_xz)
         ukf_states[t] = ukf.x_hat
 
+        # Store Hybrid EKF covariance
+        hybrid_covariances[t] = hybrid_ekf.P.copy()
+
     return {
         'true_states': true_states,
         'hybrid_states': hybrid_states,
         'standard_states': standard_states,
-        'ukf_states': ukf_states
+        'ukf_states': ukf_states,
+        'hybrid_covariances': hybrid_covariances  # Add covariances to results
     }
 
 
@@ -1028,25 +1000,43 @@ class ResultVisualizer:
 
     def plot_state_trajectories(self, save_path: Optional[Path] = None):
         """
-        Plot state trajectories with optional 2-sigma bounds 
-        (if a single measure of uncertainty is available).
+        Plot state trajectories with 2-sigma uncertainty bounds.
         """
         fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+        time_steps = len(self.results['true_states'])
+        t = np.arange(time_steps)
 
         true_states = self.results['true_states']
         estimated_states = self.results['estimated_states']
-        uncertainties = self.results['uncertainties']  # shape (T, 2) => not direct std dev
-
-        for i, label in enumerate(['x', 'y', 'z']):
-            axes[i].plot(true_states[:, i], 'k-', label='True', linewidth=2)
-            axes[i].plot(estimated_states[:, i], 'r--', label='Estimated')
-            axes[i].set_ylabel(label)
+        
+        # Get uncertainty bounds if available
+        if 'state_covariances' in self.results:
+            covariances = self.results['state_covariances']
+            std_devs = np.sqrt(np.array([np.diag(P) for P in covariances]))
+            bounds_upper = estimated_states + 2 * std_devs  # 2-sigma bounds
+            bounds_lower = estimated_states - 2 * std_devs
+        
+        state_labels = ['x', 'y', 'z']
+        for i, label in enumerate(state_labels):
+            axes[i].plot(t, true_states[:, i], 'k-', label='True', linewidth=2, alpha=0.7)
+            axes[i].plot(t, estimated_states[:, i], 'r--', label='Estimated', linewidth=2)
+            
+            if 'state_covariances' in self.results:
+                axes[i].fill_between(t, 
+                                   bounds_lower[:, i], 
+                                   bounds_upper[:, i],
+                                   color='r', alpha=0.2, label='2σ bounds')
+            
+            axes[i].set_ylabel(f'State {label}')
             axes[i].legend()
+            axes[i].grid(True)
 
         axes[-1].set_xlabel('Time step')
-        plt.suptitle('State Trajectories')
+        plt.suptitle('State Trajectories with Uncertainty Bounds')
+        
         if save_path:
-            plt.savefig(save_path / 'state_trajectories.png', dpi=300, bbox_inches='tight')
+            plt.savefig(save_path / 'state_trajectories_with_uncertainty.png', 
+                       dpi=300, bbox_inches='tight')
         plt.show()
 
     def plot_uncertainty_evolution(self, save_path: Optional[Path] = None):
@@ -1101,27 +1091,48 @@ class ComparisonVisualizer:
 
     def plot_comparative_trajectories(self, save_path: Optional[Path] = None):
         """
-        Plots x, y, z trajectories for all filters + true states.
+        Plots x, y, z trajectories for all filters + true states with uncertainty bounds
+        for the Hybrid EKF.
         """
         fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+        time_steps = len(self.results['true_states'])
+        t = np.arange(time_steps)
 
         true_states = self.results['true_states']
         hybrid_states = self.results['hybrid_states']
         standard_states = self.results['standard_states']
         ukf_states = self.results['ukf_states']
 
-        for i, label in enumerate(['x', 'y', 'z']):
-            axes[i].plot(true_states[:, i], 'k-', label='True', linewidth=2)
-            axes[i].plot(hybrid_states[:, i], 'b--', label='Hybrid EKF')
-            axes[i].plot(standard_states[:, i], 'r-.', label='Standard EKF')
-            axes[i].plot(ukf_states[:, i], 'g:', label='Unscented KF')
-            axes[i].set_ylabel(label)
+        # Get uncertainty bounds for Hybrid EKF if available
+        if 'hybrid_covariances' in self.results:
+            covariances = self.results['hybrid_covariances']
+            std_devs = np.sqrt(np.array([np.diag(P) for P in covariances]))
+            bounds_upper = hybrid_states + 2 * std_devs
+            bounds_lower = hybrid_states - 2 * std_devs
+
+        state_labels = ['x', 'y', 'z']
+        for i, label in enumerate(state_labels):
+            axes[i].plot(t, true_states[:, i], 'k-', label='True', linewidth=2, alpha=0.7)
+            axes[i].plot(t, hybrid_states[:, i], 'b--', label='Hybrid EKF', linewidth=2)
+            axes[i].plot(t, standard_states[:, i], 'r-.', label='Standard EKF', linewidth=1.5)
+            axes[i].plot(t, ukf_states[:, i], 'g:', label='Unscented KF', linewidth=1.5)
+            
+            if 'hybrid_covariances' in self.results:
+                axes[i].fill_between(t, 
+                                   bounds_lower[:, i], 
+                                   bounds_upper[:, i],
+                                   color='b', alpha=0.2, label='Hybrid EKF 2σ')
+            
+            axes[i].set_ylabel(f'State {label}')
             axes[i].legend()
+            axes[i].grid(True)
 
         axes[-1].set_xlabel('Time step')
-        plt.suptitle('Comparative State Trajectories')
+        plt.suptitle('Comparative State Trajectories with Uncertainty Bounds')
+        
         if save_path:
-            plt.savefig(save_path / 'comparative_trajectories.png', dpi=300, bbox_inches='tight')
+            plt.savefig(save_path / 'comparative_trajectories_with_uncertainty.png', 
+                       dpi=300, bbox_inches='tight')
         plt.show()
 
 

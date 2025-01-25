@@ -918,7 +918,6 @@ class IntegratedHybridEKF:
         logging.info("Stored pretrained parameters for EWC.")
 
 # Add new Hybrid UKF class
-class IntegratedHybridUKF(IntegratedHybridEKF):
     """
     Hybrid Unscented Kalman Filter combining:
     - UKF's sigma point approach

@@ -57,16 +57,18 @@ class HybridEKFConfig:
     """
     state_dim: int = 3
     measurement_dim: int = 2  # We observe only x and z
-    hidden_dim: int = 128
-    sequence_length: int = 15
+    hidden_dim: int = 64
+    sequence_length: int = 10
     learning_rate: float = 1e-3
     dt: float = 0.01
     min_covariance: float = 1e-10
     process_noise_init: float = 0.1
     measurement_noise_init: float = 0.1
-
-    # NEW: Number of steps to run in 'shadow' mode before full online learning
-    warmup_steps: int = 3000
+    warmup_steps: int = 2000
+    # NEW: Non-Gaussian noise parameters
+    noise_type: str = "gaussian"  # Options: "gaussian", "laplace", "mixed"
+    mixture_prob: float = 0.1  # Probability of outlier in mixed noise
+    outlier_scale: float = 0.1  # Scale factor for outlier component
 
 
 class CovarianceUpdateMethod(Enum):
@@ -347,7 +349,8 @@ class SimplifiedUncertaintyNetwork(nn.Module):
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(0.1)
         )
 
         # Single-layer LSTM
@@ -362,6 +365,7 @@ class SimplifiedUncertaintyNetwork(nn.Module):
         self.q_estimator = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, state_dim * state_dim)
         )
 
@@ -369,6 +373,7 @@ class SimplifiedUncertaintyNetwork(nn.Module):
         self.r_estimator = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, measurement_dim * measurement_dim)
         )
 
@@ -1079,6 +1084,37 @@ class UnscentedKF:
 # -----------------------------------------------------------------------------
 #                      PART 5: Simulation & Visualization
 # -----------------------------------------------------------------------------
+def generate_non_gaussian_noise(size: int, config: HybridEKFConfig) -> np.ndarray:
+    """
+    Generate non-Gaussian measurement noise with:
+    - 90% small Gaussian noise
+    - 10% large Laplace-distributed outliers
+    """
+    base_noise = np.random.normal(
+        0, config.measurement_noise_init, size=size
+    )
+    
+    if config.noise_type == "gaussian":
+        return base_noise
+    
+    # Generate outlier mask
+    outlier_mask = np.random.rand(size) < config.mixture_prob
+    
+    if config.noise_type == "laplace":
+        outliers = np.random.laplace(
+            loc=0,
+            scale=config.measurement_noise_init * config.outlier_scale,
+            size=size
+        )
+    elif config.noise_type == "mixed":
+        # Mixed distribution with Gaussian and Cauchy components
+        outliers = np.random.standard_cauchy(size=size) * config.outlier_scale
+    
+    return np.where(outlier_mask, 
+                  base_noise + outliers,
+                  base_noise)
+
+
 def simulate_system(
     config: HybridEKFConfig,
     time_steps: int = 5000,
@@ -1088,8 +1124,10 @@ def simulate_system(
     Run a simulation of the Lorenz system with the IntegratedHybridEKF.
     Now includes separate metrics for warmup and post-warmup periods.
     """
-    system = LorenzSystem()
-    ekf = IntegratedHybridEKF(system, config)
+    # Create a single system for generating true states
+    true_system = LorenzSystem(time_varying=True, variation_amplitude=1.2)
+    filter_system = LorenzSystem(time_varying=False)  # Filters assume constant parameters     
+    ekf = IntegratedHybridEKF(filter_system, config)
 
     # Storage
     true_states = np.zeros((time_steps, config.state_dim))
@@ -1105,12 +1143,12 @@ def simulate_system(
             logging.info(f"Simulation step {t}/{time_steps}")
 
         # System evolves
-        x_true = system.dynamics(x_true, config.dt)
+        x_true = true_system.dynamics(x_true, config.dt, t)
         true_states[t] = x_true
 
-        # Noisy measurement (x,z only)
-        measured_xz = x_true[[0, 2]] + np.random.normal(
-            0, config.measurement_noise_init, size=2
+        # Modified measurement generation
+        measured_xz = x_true[[0, 2]] + generate_non_gaussian_noise(
+            2, config
         )
 
         # EKF steps
@@ -1198,9 +1236,9 @@ def simulate_comparative_system(
         x_true = true_system.dynamics(x_true, dt, t)
         true_states[t] = x_true
 
-        # Noisy measurement
-        measured_xz = x_true[[0, 2]] + np.random.normal(
-            0, config.measurement_noise_init, size=2
+        # Modified measurement generation
+        measured_xz = x_true[[0, 2]] + generate_non_gaussian_noise(
+            2, config if config else HybridEKFConfig()
         )
 
         # --- Hybrid EKF ---
@@ -1342,6 +1380,23 @@ class ResultVisualizer:
             plt.savefig(save_path / 'learning_metrics.png', dpi=300, bbox_inches='tight')
         plt.show()
 
+    def plot_noise_characteristics(self, save_path: Optional[Path] = None):
+        """New method to visualize noise distribution"""
+        noise_samples = generate_non_gaussian_noise(
+            10000, HybridEKFConfig(noise_type="mixed")
+        )
+        
+        plt.figure(figsize=(12, 6))
+        sns.histplot(noise_samples, kde=True, bins=100)
+        plt.title("Non-Gaussian Noise Distribution (Mixture Model)")
+        plt.xlabel("Noise Amplitude")
+        plt.ylabel("Density")
+        
+        if save_path:
+            plt.savefig(save_path / 'noise_distribution.png', 
+                       dpi=300, bbox_inches='tight')
+        plt.show()
+
 
 class ComparisonVisualizer:
     """
@@ -1424,11 +1479,11 @@ def main(mode: str = 'default'):
         config = HybridEKFConfig(
             state_dim=3,
             measurement_dim=2,
-            hidden_dim=16,
-            sequence_length=20,
+            hidden_dim=64,
+            sequence_length=50,
             dt=0.01,
             learning_rate=0.001,
-            warmup_steps=500  # adjust as needed
+            warmup_steps=1500  # adjust as needed
         )
 
         results = simulate_system(
@@ -1442,6 +1497,7 @@ def main(mode: str = 'default'):
         viz.plot_state_trajectories(output_dir)
         viz.plot_uncertainty_evolution(output_dir)
         viz.plot_learning_metrics(output_dir)
+        viz.plot_noise_characteristics(output_dir)
 
         # Update logging to show split metrics
         metrics = results['performance_metrics']

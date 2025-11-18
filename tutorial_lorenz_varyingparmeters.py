@@ -66,7 +66,7 @@ class HybridEKFConfig:
     measurement_noise_init: float = 0.1
 
     # NEW: Number of steps to run in 'shadow' mode before full online learning
-    warmup_steps: int = 3000
+    warmup_steps: int = 1000
 
 
 class CovarianceUpdateMethod(Enum):
@@ -179,8 +179,8 @@ class LorenzSystem:
         
         # Parameters for unmodeled dynamics
         if unmodeled_dynamics:
-            self.epsilon = 8.1  # Strength of unmodeled terms
-            self.omega = 10.0    # Frequency of oscillation
+            self.epsilon = 5.1  # Strength of unmodeled terms
+            self.omega =10.0    # Frequency of oscillation
             
     def derivatives(self, state: np.ndarray, t: float = 0.0) -> np.ndarray:
         """Compute derivatives with optional unmodeled dynamics."""
@@ -478,9 +478,10 @@ class IntegratedHybridEKF:
       - **Shadow/Warmup mode** for first config.warmup_steps (no neural training/correction)
     """
 
-    def __init__(self, system: LorenzSystem, config: HybridEKFConfig) -> None:
+    def __init__(self, system: LorenzSystem, config: HybridEKFConfig, use_ewc: bool = True) -> None:
         self.system = system
         self.config = config
+        self.use_ewc = use_ewc
 
         # EKF state
         self.x_hat = np.zeros(config.state_dim)
@@ -697,6 +698,7 @@ class IntegratedHybridEKF:
         self.state_buffer.append(state)
         if innovation is not None:
             self.innovation_buffer.append(innovation)
+
     def _compute_uncertainty_loss(self,
                                   innovation: np.ndarray,
                                   R: torch.Tensor,
@@ -718,6 +720,7 @@ class IntegratedHybridEKF:
         # Gaussian log-likelihood:
         ll = -0.5 * (2 * np.log(2.0 * np.pi) + logdetR + mahalanobis)
         return -ll.squeeze()
+
     def _online_learning(self,
                          measurement: np.ndarray,
                          innovation: np.ndarray,
@@ -770,10 +773,12 @@ class IntegratedHybridEKF:
                 replay_loss = F.mse_loss(replay_partial, replay_meas)
             
             # EWC loss
-            ewc_physics = self.compute_ewc_loss(
-                dict(self.physics_net.named_parameters()),
-                self.pretrained_physics
-            )
+            ewc_physics = torch.tensor(0.0).to(DEVICE)
+            if self.use_ewc:
+                ewc_physics = self.compute_ewc_loss(
+                    dict(self.physics_net.named_parameters()),
+                    self.pretrained_physics
+                )
             
             # Total physics loss
             physics_total_loss = current_loss + 0.1 * physics_loss + 0.3 * replay_loss + ewc_physics
@@ -789,10 +794,12 @@ class IntegratedHybridEKF:
                                                 dt=self.config.dt)
             
             uncertainty_loss = self._compute_uncertainty_loss(innovation, current_uncert['R'], None)
-            ewc_uncertainty = self.compute_ewc_loss(
-                dict(self.uncertainty_net.named_parameters()),
-                self.pretrained_uncertainty
-            )
+            ewc_uncertainty = torch.tensor(0.0).to(DEVICE)
+            if self.use_ewc:
+                ewc_uncertainty = self.compute_ewc_loss(
+                    dict(self.uncertainty_net.named_parameters()),
+                    self.pretrained_uncertainty
+                )
             
             total_uncertainty_loss = uncertainty_loss + ewc_uncertainty
             total_uncertainty_loss.backward()
@@ -1093,6 +1100,7 @@ class IntegratedHybridUKF(IntegratedHybridEKF):
             sigma_points[self.n+i+1] = self.x_hat - sqrt_cov[i]
 
         return sigma_points
+
 class StandardEKF:
     """
     A standard Extended Kalman Filter for comparison.
@@ -1334,7 +1342,8 @@ def simulate_system(
 def simulate_comparative_system(
     time_steps: int = 5000,
     dt: float = 0.01,
-    config: Optional[HybridEKFConfig] = None
+    config: Optional[HybridEKFConfig] = None,
+    noise_type: str = 'non_gaussian'  # 'normal' for Gaussian or 'non_gaussian' for Laplace noise
 ) -> Dict[str, np.ndarray]:
     """
     Run a comparative simulation with uncertainty tracking for Hybrid EKF, 
@@ -1344,24 +1353,23 @@ def simulate_comparative_system(
         config = HybridEKFConfig(dt=dt)
 
     # Initialize systems
-    true_system = LorenzSystem(unmodeled_dynamics=True)  # With unmodeled dynamics
-    filter_system = LorenzSystem(unmodeled_dynamics=False)  # Basic model for filters   
+    true_system = LorenzSystem(unmodeled_dynamics=True)       # True system with unmodeled dynamics
+    filter_system = LorenzSystem(unmodeled_dynamics=False)      # Basic model for filters
+
     # Initialize the three filters
-    hybrid_ekf = IntegratedHybridEKF(filter_system, config)
+    hybrid_ekf = IntegratedHybridEKF(filter_system, config, use_ewc=True)
     standard_ekf = StandardEKF(filter_system, state_dim=config.state_dim)
     ukf = UnscentedKF(filter_system, state_dim=config.state_dim)
-    
 
     # Allocate storage
     true_states = np.zeros((time_steps, config.state_dim))
     hybrid_states = np.zeros_like(true_states)
     standard_states = np.zeros_like(true_states)
     ukf_states = np.zeros_like(true_states)
-
-    # Add storage for Hybrid EKF covariances
     hybrid_covariances = np.zeros((time_steps, config.state_dim, config.state_dim))
+    hybrid_uncertainties = np.zeros((time_steps, 2))  # To store [q_confidence, r_confidence] for hybrid EKF
 
-    x_true = np.array([1.0, 1.0, 1.0])  # initial condition
+    x_true = np.array([1.0, 1.0, 1.0])  # Initial condition
 
     for t in range(time_steps):
         if t % 100 == 0:
@@ -1371,15 +1379,20 @@ def simulate_comparative_system(
         x_true = true_system.dynamics(x_true, dt, t)
         true_states[t] = x_true
 
-        # Noisy measurement
-        measured_xz = x_true[[0, 2]] + np.random.normal(
-            0, config.measurement_noise_init, size=2
-        )
+        # Generate noisy measurement (observing x and z)
+        if noise_type == 'non_gaussian':
+            measured_xz = x_true[[0, 2]] + np.random.laplace(0, config.measurement_noise_init*5, size=2)
+        else:
+            measured_xz = x_true[[0, 2]] + np.random.normal(0, config.measurement_noise_init, size=2)
 
         # --- Hybrid EKF ---
         hybrid_ekf.predict(dt)
         hybrid_ekf.update(measured_xz)
         hybrid_states[t] = hybrid_ekf.x_hat
+        hybrid_covariances[t] = hybrid_ekf.P.copy()
+        if hybrid_ekf.metrics['q_confidence'] and hybrid_ekf.metrics['r_confidence']:
+            hybrid_uncertainties[t, 0] = hybrid_ekf.metrics['q_confidence'][-1]
+            hybrid_uncertainties[t, 1] = hybrid_ekf.metrics['r_confidence'][-1]
 
         # --- Standard EKF ---
         standard_ekf.predict(dt)
@@ -1391,36 +1404,26 @@ def simulate_comparative_system(
         ukf.update(measured_xz)
         ukf_states[t] = ukf.x_hat
 
-        # Store Hybrid EKF covariance
-        hybrid_covariances[t] = hybrid_ekf.P.copy()
-
-    # Calculate post-warmup RMSE for each filter
-    warmup_steps = config.warmup_steps if config else 500  # Default warmup if no config
-    
     def calculate_split_metrics(estimated, true):
-        warmup_rmse = np.sqrt(np.mean(
-            (true[:warmup_steps] - estimated[:warmup_steps])**2
-        ))
-        post_warmup_rmse = np.sqrt(np.mean(
-            (true[warmup_steps:] - estimated[warmup_steps:])**2
-        ))
-        transition_rmse = np.sqrt(np.mean(
-            (true[warmup_steps:warmup_steps+100] - 
-             estimated[warmup_steps:warmup_steps+100])**2
-        ))
+        warmup_rmse = np.sqrt(np.mean((true[:config.warmup_steps] - estimated[:config.warmup_steps])**2))
+        post_warmup_rmse = np.sqrt(np.mean((true[config.warmup_steps:] - estimated[config.warmup_steps:])**2))
+        transition_rmse = np.sqrt(np.mean((true[config.warmup_steps:config.warmup_steps+100] - 
+                                             estimated[config.warmup_steps:config.warmup_steps+100])**2))
         return {
             'warmup_rmse': warmup_rmse,
             'post_warmup_rmse': post_warmup_rmse,
             'transition_rmse': transition_rmse
         }
-    
+
     return {
         'true_states': true_states,
         'hybrid_states': hybrid_states,
         'standard_states': standard_states,
         'ukf_states': ukf_states,
         'hybrid_covariances': hybrid_covariances,
-        'warmup_steps': warmup_steps,
+        'hybrid_uncertainties': hybrid_uncertainties,
+        'hybrid_metrics': hybrid_ekf.metrics,
+        'warmup_steps': config.warmup_steps,
         'performance_metrics': {
             'hybrid': calculate_split_metrics(hybrid_states, true_states),
             'standard': calculate_split_metrics(standard_states, true_states),
@@ -1516,6 +1519,7 @@ class ResultVisualizer:
         plt.show()
 
 
+
 class ComparisonVisualizer:
     """
     Visualization for analyzing multiple filters side by side.
@@ -1523,7 +1527,8 @@ class ComparisonVisualizer:
     def __init__(self, results: Dict[str, np.ndarray]):
         """
         results keys:
-            'true_states', 'hybrid_states', 'standard_states', 'ukf_states'
+            'true_states', 'hybrid_states', 'standard_states', 'ukf_states',
+            'hybrid_covariances', 'hybrid_uncertainties', 'hybrid_metrics'
         """
         self.results = results
         sns.set_style("whitegrid")
@@ -1531,8 +1536,7 @@ class ComparisonVisualizer:
 
     def plot_comparative_trajectories(self, save_path: Optional[Path] = None):
         """
-        Plots x, y, z trajectories for all filters + true states 
-        with uncertainty bounds for the Hybrid EKF.
+        Plots state trajectories for all filters along with uncertainty bounds for the Hybrid EKF.
         """
         fig, axes = plt.subplots(3, 1, figsize=(12, 10))
         time_steps = len(self.results['true_states'])
@@ -1543,7 +1547,6 @@ class ComparisonVisualizer:
         standard_states = self.results['standard_states']
         ukf_states = self.results['ukf_states']
 
-        # Get uncertainty bounds for Hybrid EKF if available
         if 'hybrid_covariances' in self.results:
             covariances = self.results['hybrid_covariances']
             std_devs = np.sqrt(np.array([np.diag(P) for P in covariances]))
@@ -1558,21 +1561,140 @@ class ComparisonVisualizer:
             axes[i].plot(t, ukf_states[:, i], 'g:', label='Unscented KF', linewidth=1.5)
             
             if 'hybrid_covariances' in self.results:
-                axes[i].fill_between(t, 
-                                     bounds_lower[:, i], 
-                                     bounds_upper[:, i],
+                axes[i].fill_between(t, bounds_lower[:, i], bounds_upper[:, i],
                                      color='b', alpha=0.2, label='Hybrid EKF 2σ')
             
             axes[i].set_ylabel(f'State {label}')
             axes[i].legend()
             axes[i].grid(True)
-
         axes[-1].set_xlabel('Time step')
         plt.suptitle('Comparative State Trajectories with Uncertainty Bounds')
         
         if save_path:
             plt.savefig(save_path / 'comparative_trajectories_with_uncertainty.png', 
                         dpi=300, bbox_inches='tight')
+        plt.show()
+
+    def plot_comparative_errors(self, save_path: Optional[Path] = None):
+        """
+        Plot the L2-norm of the state estimation errors for each filter over time.
+        This serves as a benchmark comparison.
+        """
+        true_states = self.results['true_states']
+        error_hybrid = np.linalg.norm(true_states - self.results['hybrid_states'], axis=1)
+        error_standard = np.linalg.norm(true_states - self.results['standard_states'], axis=1)
+        error_ukf = np.linalg.norm(true_states - self.results['ukf_states'], axis=1)
+        t = np.arange(len(true_states))
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(t, error_hybrid, label='Hybrid EKF Error', linestyle='--', color='b', linewidth=2)
+        plt.plot(t, error_standard, label='Standard EKF Error', linestyle='-.', color='r', linewidth=2)
+        plt.plot(t, error_ukf, label='Unscented KF Error', linestyle=':', color='g', linewidth=2)
+        plt.xlabel('Time step')
+        plt.ylabel('Estimation Error (L2 norm)')
+        plt.title('Benchmark: Filter Estimation Errors Over Time')
+        plt.legend()
+        plt.grid(True)
+        if save_path:
+            plt.savefig(save_path / 'benchmark_errors.png', dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    def plot_hybrid_details(self, save_path: Optional[Path] = None):
+        """
+        Plot detailed Hybrid EKF metrics including:
+          - State trajectories with 2σ uncertainty bounds,
+          - Uncertainty evolution (Q and R confidence),
+          - Learning metrics (prediction and uncertainty losses).
+        """
+        t = np.arange(len(self.results['hybrid_states']))
+        hybrid_states = self.results['hybrid_states']
+        hybrid_cov = self.results['hybrid_covariances']
+        true_states = self.results['true_states']
+        
+        # Plot state trajectories with uncertainty bounds for Hybrid EKF
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+        state_labels = ['x', 'y', 'z']
+        std_devs = np.sqrt(np.array([np.diag(P) for P in hybrid_cov]))
+        bounds_upper = hybrid_states + 2 * std_devs
+        bounds_lower = hybrid_states - 2 * std_devs
+        
+        for i, label in enumerate(state_labels):
+            axes[i].plot(t, true_states[:, i], 'k-', label='True', linewidth=2, alpha=0.7)
+            axes[i].plot(t, hybrid_states[:, i], 'b--', label='Hybrid EKF', linewidth=2)
+            axes[i].fill_between(t, bounds_lower[:, i], bounds_upper[:, i],
+                                 color='b', alpha=0.2, label='2σ bounds')
+            axes[i].set_ylabel(f'State {label}')
+            axes[i].legend()
+            axes[i].grid(True)
+        axes[-1].set_xlabel('Time step')
+        plt.suptitle('Hybrid EKF State Trajectories with 2σ Uncertainty Bounds')
+        if save_path:
+            plt.savefig(save_path / 'hybrid_state_trajectories.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # Plot uncertainty evolution (Q and R confidence)
+        if 'hybrid_uncertainties' in self.results:
+            hybrid_unc = self.results['hybrid_uncertainties']
+            plt.figure(figsize=(12, 5))
+            plt.plot(hybrid_unc[:, 0], label='Q Confidence', linewidth=2)
+            plt.plot(hybrid_unc[:, 1], label='R Confidence', linewidth=2)
+            plt.xlabel('Time step')
+            plt.ylabel('Confidence')
+            plt.title('Hybrid EKF Uncertainty Evolution')
+            plt.legend()
+            plt.grid(True)
+            if save_path:
+                plt.savefig(save_path / 'hybrid_uncertainty_evolution.png', dpi=300, bbox_inches='tight')
+            plt.show()
+        
+        # Plot learning metrics for Hybrid EKF if available
+        if 'hybrid_metrics' in self.results:
+            metrics = self.results['hybrid_metrics']
+            if metrics['prediction_loss'] and metrics['uncertainty_loss']:
+                fig, axes = plt.subplots(2, 1, figsize=(12, 6))
+                axes[0].plot(metrics['prediction_loss'], label='Prediction Loss', color='m', linewidth=2)
+                axes[0].set_title('Hybrid EKF Prediction Loss')
+                axes[0].legend()
+                axes[0].grid(True)
+                
+                axes[1].plot(metrics['uncertainty_loss'], label='Uncertainty Loss', color='c', linewidth=2)
+                axes[1].set_title('Hybrid EKF Uncertainty Loss')
+                axes[1].legend()
+                axes[1].grid(True)
+                
+                plt.tight_layout()
+                if save_path:
+                    plt.savefig(save_path / 'hybrid_learning_metrics.png', dpi=300, bbox_inches='tight')
+                plt.show()
+
+    def plot_rmse_bar_chart(self, save_path: Optional[Path] = None):
+        """
+        Plot a bar graph comparing Warmup RMSE and Post-Warmup RMSE for each filter.
+        """
+        performance_metrics = self.results.get("performance_metrics", {})
+        filters = list(performance_metrics.keys())
+        warmup_rmse = [performance_metrics[f]['warmup_rmse'] for f in filters]
+        post_warmup_rmse = [performance_metrics[f]['post_warmup_rmse'] for f in filters]
+
+        x = np.arange(len(filters))
+        width = 0.35
+
+        fig, ax = plt.subplots(figsize=(8,6))
+        rects1 = ax.bar(x - width/2, warmup_rmse, width, label='Warmup RMSE', color='red')
+        rects2 = ax.bar(x + width/2, post_warmup_rmse, width, label='Post-Warmup RMSE', color='green')
+
+        ax.set_ylabel('RMSE')
+        ax.set_title('Comparison of Warmup and Post-Warmup RMSE for Filters')
+        ax.set_xticks(x)
+        ax.set_xticklabels(filters)
+        ax.legend()
+
+        ax.bar_label(rects1, padding=3)
+        ax.bar_label(rects2, padding=3)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path / 'rmse_comparison_bar_chart.png', dpi=300, bbox_inches='tight')
         plt.show()
 
 
@@ -1635,6 +1757,9 @@ def main(mode: str = 'default'):
         # Visualization
         comp_viz = ComparisonVisualizer(comparative_results)
         comp_viz.plot_comparative_trajectories(output_dir)
+        comp_viz.plot_comparative_errors(output_dir)
+        comp_viz.plot_hybrid_details(output_dir)
+        comp_viz.plot_rmse_bar_chart(output_dir)
 
         # Update logging for comparative results
         metrics = comparative_results['performance_metrics']

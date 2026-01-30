@@ -12,6 +12,14 @@ The Hybrid EKF framework integrates classical filtering techniques with modern d
 - Continual learning with experience replay and Elastic Weight Consolidation (EWC)
 - Shadow/warmup mode for smooth transition from classical to hybrid filtering
 
+## Technical Details
+
+### Hybrid EKF Architecture
+
+<img width="2816" height="1536" alt="HEKF-archi" src="https://github.com/user-attachments/assets/2c804fc4-cad3-419a-a2aa-217b9d88caca" />
+
+<img width="2816" height="1536" alt="Traning_inference" src="https://github.com/user-attachments/assets/aee4377c-8c0a-4717-b159-0f03e9b35c09" />
+
 ## Features
 
 ### Filtering Methods
@@ -106,14 +114,6 @@ config = HybridEKFConfig(
     warmup_steps=1000          # Number of shadow mode steps
 )
 ```
-
-## Technical Details
-
-### Hybrid EKF Architecture
-
-<img width="2816" height="1536" alt="HEKF-archi" src="https://github.com/user-attachments/assets/2c804fc4-cad3-419a-a2aa-217b9d88caca" />
-
-<img width="2816" height="1536" alt="Traning_inference" src="https://github.com/user-attachments/assets/aee4377c-8c0a-4717-b159-0f03e9b35c09" />
 
 ## License
 

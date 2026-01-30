@@ -107,89 +107,13 @@ config = HybridEKFConfig(
 )
 ```
 
-## Project Structure
-
-```
-.
-├── tutorial_lorenz_varyingparmeters.py  # Main implementation
-├── requirements.txt                      # Python dependencies
-├── README.md                             # This file
-└── hybrid_ekf_results_seq/              # Output directory
-    ├── comparative_trajectories_with_uncertainty.png
-    ├── benchmark_errors.png
-    ├── hybrid_state_trajectories.png
-    ├── hybrid_uncertainty_evolution.png
-    ├── hybrid_learning_metrics.png
-    ├── rmse_comparison_bar_chart.png
-    └── simulation_results.npz
-```
-
 ## Technical Details
-
-### Lorenz System
-
-The system models the chaotic Lorenz attractor with time-varying parameters:
-
-```
-dx/dt = σ(t)(y - x) + ε sin(ωt) y
-dy/dt = x(ρ(t) - z) - y + ε cos(ωt) x
-dz/dt = xy - β(t)z + ε sin(ωt + π/4) z
-```
-
-Where:
-- σ, ρ, β are time-varying parameters
-- ε controls the strength of unmodeled dynamics
-- Only x and z components are observed (partial observability)
 
 ### Hybrid EKF Architecture
 
-1. **Prediction Step**:
-   - Physics-based prior: `x_prior = f(x_k, u_k)`
-   - Neural correction: `x_pred = x_prior + NN_physics(state_sequence)`
-   - Adaptive process noise: `Q = NN_uncertainty(state_sequence, innovation_sequence)`
+<img width="2816" height="1536" alt="HEKF-archi" src="https://github.com/user-attachments/assets/2c804fc4-cad3-419a-a2aa-217b9d88caca" />
 
-2. **Update Step**:
-   - Classical Kalman update with adaptive measurement noise
-   - `R = NN_uncertainty(state_sequence, innovation_sequence)`
-   - Joseph form covariance update for numerical stability
-
-3. **Online Learning**:
-   - Physics network loss: MSE between prediction and measurement + L2 regularization
-   - Uncertainty network loss: Negative log-likelihood of innovation + EWC penalty
-   - Experience replay from buffer to prevent catastrophic forgetting
-
-### Shadow/Warmup Mode
-
-During the first `warmup_steps`:
-- Neural networks are not used for corrections
-- System operates as a standard EKF
-- Data is collected for pre-training
-- At the end of warmup, networks are pre-trained on collected data
-- Transition to online learning with neural enhancements
-
-This approach ensures:
-- Stable initial learning
-- Better initialization than random weights
-- Smooth transition from classical to hybrid filtering
-
-## Results
-
-The project generates several visualizations:
-
-### State Trajectories
-Shows the true state vs. estimated state for all three components (x, y, z) with 2σ uncertainty bounds.
-
-### Benchmark Errors
-Compares L2-norm estimation errors over time for all filters, demonstrating the performance advantage of the hybrid approach.
-
-### Uncertainty Evolution
-Tracks the confidence in Q (process noise) and R (measurement noise) estimates over time.
-
-### Learning Metrics
-Displays the training loss for both physics and uncertainty networks during online learning.
-
-### RMSE Comparison
-Bar chart comparing warmup and post-warmup Root Mean Square Error (RMSE) for each filter.
+<img width="2816" height="1536" alt="Traning_inference" src="https://github.com/user-attachments/assets/aee4377c-8c0a-4717-b159-0f03e9b35c09" />
 
 ## License
 
